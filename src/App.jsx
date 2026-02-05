@@ -164,7 +164,7 @@ const useLecConfig = (db, user) => {
     importFields: {
       nomina: "Legajo,CUIL,Nombre,Apellido,Remuneracion2,Puesto,Fecha_Alta",
       ventas: "Fecha,Tipo_Cbte,Punto_Venta,Numero,Cliente,CUIT,Neto_Gravado,Total,Moneda",
-      capacitacion: "Nombre_Curso,Proveedor,CUIL_Asistente,Fecha_Realizacion,Costo_Total,Horas_Duracion",
+      capacitacion: "Tipo de gasto,descripcion,CUIL,Apellido,Nombre,genero,Fecha_Nacimiento,es empleado?,Obtuvo Beneficios,Tipo Entidad Capacitadora,esparte del sistema educativo?,Denominacion,Capacitador_CUIT,Monto Inversion,Justificacion,Link_Factura,Link_Programa,Link_Certificado",
       compras: "Fecha,Proveedor,CUIT,Concepto,Monto_Neto,IVA,Total,Proyecto_ID_Asociado"
     },
     qualityNorms: []
@@ -446,6 +446,7 @@ const DashboardLEC = ({
     targetPctID,
     targetIDCount,
     targetQualityCount,
+    targetPayroll,
     bienioStart,
     bienioEnd,
     qualityNorms
@@ -471,7 +472,7 @@ const DashboardLEC = ({
   const annualPayrollActual = totalPayroll * 12; // Check if this logic is desired, assuming totalPayroll is annual-ish 
   // Fix avgSalary to use records count (months paid) instead of headcount
   const avgSalary = nominaRecords > 0 ? totalPayroll / nominaRecords : 0;
-  const annualPayrollTarget = avgSalary * targetHeadcount * 12;
+  const annualPayrollTarget = targetPayroll > 0 ? targetPayroll : avgSalary * targetHeadcount * 12;
   const pctTrainingVsPayrollActual = annualPayrollActual > 0 ? (totalTraining / annualPayrollActual) * 100 : 0;
   const pctTrainingVsPayrollTarget = annualPayrollTarget > 0 ? (totalTraining / annualPayrollTarget) * 100 : 0;
 
@@ -768,7 +769,7 @@ const ImportarArchivos = ({ db, user, config }) => {
       case 'IVA_VENTAS': fields = config.importFields?.ventas || "Fecha,Tipo_Cbte,Numero,Cliente,CUIT,Neto_Gravado,Impuestos,Total,Moneda,Pais,Detalle,Centro_Costo,Actividad,Promovido"; break;
       case 'IVA_COMPRAS': fields = config.importFields?.compras || "Fecha,Proveedor,CUIT,Concepto,Monto_Neto,IVA,Total,Proyecto_ID_Asociado"; break;
       case 'CAPACITACION': fields = config.importFields?.capacitacion || "Periodo,Curso_Titulo,Curso_Descripcion,Tipo_Gasto,CUIL_Asistente,Apellido_Asistente,Nombre_Asistente,Genero,Fecha_Nacimiento,Es_Empleado,Obtuvo_Beneficio,Capacitador_Tipo,Capacitador_Sist_Educ,Capacitador_Nombre,Capacitador_CUIT,Monto,Justificacion,Link_Factura,Link_Programa,Link_Certificado"; break;
-      case 'PRIMER_EMPLEO': fields = "Periodo,CUIL_Empleado,Apellido,Nombre,Genero,Fecha_de_alta,Monto_total_Rem_Bruta_F931"; break;
+      case 'PRIMER_EMPLEO': fields = "CUIL_Empleado,Apellido,Nombre,Genero,Fecha_Alta,Rem_Bruta_F931"; break;
       case 'ADQUISICION_EQUIPAMIENTO': fields = "Periodo,Detalle_Equipamiento_Adquirido,Destino_del_equipamiento,Tipo_Comprobante,Nro_Comprobante,Fecha_comprobante,Costo_Total_sin_iva,Justificacion"; break;
       case 'PROYECTOS': fields = "Nombre,Descripcion,Fecha_Inicio,Presupuesto_Estimado"; break;
       default: fields = "Campo1,Campo2";
@@ -785,27 +786,96 @@ const ImportarArchivos = ({ db, user, config }) => {
   };
 
   const parseCSV = (text) => {
-    // Standardize line endings and filter truly empty or whitespace-only lines
-    const lines = text.split(/\r?\n/).filter(line => line.trim() !== '' && line.replace(/[,;]/g, '').trim() !== '');
+    // Standardize line endings and filter truly empty lines
+    const lines = text.split(/\r?\n/).filter(line => line.trim() !== '');
     if (lines.length < 2) return [];
 
-    const headerLine = lines[0].replace(/^\uFEFF/, '');
-    const semicolonCount = (headerLine.match(/;/g) || []).length;
-    const commaCount = (headerLine.match(/,/g) || []).length;
-    const delimiter = semicolonCount > commaCount ? ';' : ',';
+    const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    const headers = headerLine.split(delimiter).map(h => h.trim().replace(/^"|"$/g, ''));
+    const headerLine = lines[0].replace(/^\uFEFF/, ''); // Remove BOM if present
+
+    // Robust Delimiter Detection
+    // 1. Check Header Line first (most reliable)
+    const candidates = [';', ',', '\t', '|'];
+    let bestDelimiter = ';'; // Default for Spanish Excel
+    let maxCount = 0;
+
+    candidates.forEach(d => {
+      // Check first line only. Usually header defines structure.
+      const count = (headerLine.match(new RegExp(escapeRegExp(d), 'g')) || []).length;
+      if (count > maxCount) {
+        maxCount = count;
+        bestDelimiter = d;
+      }
+    });
+
+    // Fallback: If header has 0 delimiters, check first 5 lines
+    if (maxCount === 0) {
+      const previewLines = lines.slice(1, 6);
+      candidates.forEach(d => {
+        const counts = previewLines.map(line => (line.match(new RegExp(escapeRegExp(d), 'g')) || []).length);
+        const total = counts.reduce((a, b) => a + b, 0);
+        if (total > maxCount) {
+          maxCount = total;
+          bestDelimiter = d;
+        }
+      });
+    }
+
+    const delimiter = bestDelimiter;
+    console.log(`Detected Delimiter: "${delimiter.replace('\t', '\\t')}" with count ${maxCount}`);
+
+    // Helper to split line respecting quotes (Robust Parsing)
+    const splitLine = (line) => {
+      const values = [];
+      let current = '';
+      let inQuotes = false;
+
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (char === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            current += '"'; // Handle escaped quotes
+            i++;
+          } else {
+            inQuotes = !inQuotes; // Toggle quote state
+          }
+        } else if (char === delimiter && !inQuotes) {
+          values.push(current);
+          current = '';
+        } else {
+          current += char;
+        }
+      }
+      values.push(current);
+      return values;
+    };
+
+    const headers = splitLine(headerLine).map(h => h.trim().replace(/^"|"$/g, ''));
+
+    // Validation: If headers (after split) is only 1 element, we might have chosen wrong delimiter.
+    if (headers.length === 1 && (delimiter === ';' || delimiter === ',')) {
+      // Logic to maybe warn or retry could go here, but for now we trust the maxCount
+    }
 
     return lines.slice(1).map(line => {
-      const values = line.split(delimiter).map(v => v.trim().replace(/^"|"$/g, ''));
-      const obj = {};
-      headers.forEach((header, index) => {
-        obj[header] = values[index] || "";
-      });
-      return obj;
+      // Safe regex check for empty lines
+      if (line.trim().replace(new RegExp(escapeRegExp(delimiter), 'g'), '') === '') return null;
+
+      try {
+        const values = splitLine(line).map(v => v.trim());
+        const obj = {};
+        headers.forEach((header, index) => {
+          const val = values[index] || "";
+          obj[header] = val.replace(/^"|"$/g, '');
+        });
+        return obj;
+      } catch (e) {
+        console.warn("Error parsing line:", line, e);
+        return null;
+      }
     }).filter(record => {
-      // Basic check: at least one field should have meaningful data
-      return Object.values(record).some(val => val !== "");
+      return record && Object.values(record).some(val => val !== "");
     });
   };
 
@@ -821,10 +891,24 @@ const ImportarArchivos = ({ db, user, config }) => {
   };
 
   const findValue = (record, possibleFields) => {
-    const fields = possibleFields.split(',').map(f => f.trim().toLowerCase());
+    // Fuzzy matching: normalize to lowercase, remove accents, and remove non-alphanumeric
+    const normalize = (str) => str
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]/g, '');
+
+    // Support exact matches first (legacy)
+    const exactFields = possibleFields.split(',').map(f => f.trim());
+    for (const f of exactFields) {
+      if (record[f] !== undefined) return record[f];
+    }
+
+    const fields = exactFields.map(f => normalize(f));
     const recordKeys = Object.keys(record);
+
     for (const key of recordKeys) {
-      if (fields.includes(key.toLowerCase())) return record[key];
+      if (fields.includes(normalize(key))) return record[key];
     }
     return "";
   };
@@ -892,25 +976,25 @@ const ImportarArchivos = ({ db, user, config }) => {
           collection: 'lec_capacitaciones',
           data: {
             periodo: formattedPeriod || findValue(record, "Periodo"),
-            tipoGasto: findValue(record, "Tipo_Gasto,Tipo_de_gasto,Tipo") || 'Capacitación_Interna',
-            cursoTitulo: findValue(record, "Curso_Titulo,Titulo") || '',
-            cursoDescripcion: findValue(record, "Curso_Descripcion,Descripcion") || '',
-            cuilAsistente: findValue(record, "CUIL_Asistente,CUIL,C.U.I.L.") || '',
-            apellidoAsistente: findValue(record, "Apellido_Asistente,Apellido") || '',
-            nombreAsistente: findValue(record, "Nombre_Asistente,Nombre") || '',
-            genero: findValue(record, "Genero") || '',
-            fechaNacimiento: findValue(record, "Fecha_Nacimiento") || '',
-            esEmpleado: findValue(record, 'Es_Empleado,Es_empleado_de_la_empresa?') === 'SI' || findValue(record, 'Es_Empleado') === 'true',
-            obtuvoBeneficio: findValue(record, 'Obtuvo_Beneficio,Obtubo_beneficios') === 'SI' || findValue(record, 'Obtuvo_Beneficio') === 'true',
-            capacitadorTipo: findValue(record, "Capacitador_Tipo,Tipo_entidad_capacitadora") || 'Universidad Publica',
-            capacitadorEsNacional: findValue(record, "Capacitador_Sist_Educ") || 'SI',
-            capacitadorNombre: findValue(record, "Capacitador_Nombre,Entidad") || '',
-            capacitadorCUIT: findValue(record, "Capacitador_CUIT") || '',
-            monto: parseNumber(findValue(record, "Monto,Monto_$") || 0),
-            justificacion: findValue(record, "Justificacion,justificacion_relacion_Act_Prom") || '',
-            facturaFile: findValue(record, "Link_Factura") || '',
-            programaFile: findValue(record, "Link_Programa") || '',
-            certificadoFile: findValue(record, "Link_Certificado") || '',
+            tipoGasto: findValue(record, "Tipo_Gasto,Tipo_de_gasto,Tipo,Tipo de gasto") || 'Capacitación_Interna',
+            cursoTitulo: findValue(record, "Curso_Titulo,Titulo,Nombre_Curso,Curso,Materia,descripcion") || '',
+            cursoDescripcion: findValue(record, "Curso_Descripcion,Descripcion,Descripcion_Curso,Temario") || '',
+            cuilAsistente: findValue(record, "CUIL_Asistente,CUIL,CUIL_Asistente_O_Becado,C.U.I.L.") || '',
+            apellidoAsistente: findValue(record, "Apellido_Asistente,Apellido,Apellidos") || '',
+            nombreAsistente: findValue(record, "Nombre_Asistente,Nombre,Nombres") || '',
+            genero: findValue(record, "Genero,genero") || '',
+            fechaNacimiento: findValue(record, "Fecha_Nacimiento,Fecha_de_Nacimiento,Fecha_Nacim") || '',
+            esEmpleado: findValue(record, 'Es_Empleado,es empleado?,Es_empleado_de_la_empresa?,Posee_Relacion_Dependencia') === 'SI' || findValue(record, 'Es_Empleado') === 'true' || findValue(record, 'es empleado?') === 'SI',
+            obtuvoBeneficio: findValue(record, 'Obtuvo_Beneficio,Obtuvo Beneficios,Obtubo_beneficios,Recibio_Otros_Beneficios') === 'SI' || findValue(record, 'Obtuvo_Beneficio') === 'true' || findValue(record, 'Obtuvo Beneficios') === 'SI',
+            capacitadorTipo: findValue(record, "Capacitador_Tipo,Tipo Entidad Capacitadora,Tipo_entidad_capacitadora,Tipo_Capacitador") || 'Universidad Publica',
+            capacitadorEsNacional: findValue(record, "Capacitador_Sist_Educ,esparte del sistema educativo?,Pertenece_Sist_Educativo") || 'SI',
+            capacitadorNombre: findValue(record, "Capacitador_Nombre,Denominacion,Entidad,Proveedor,Nombre_Entidad,Razon_Social_Capacitador") || '',
+            capacitadorCUIT: findValue(record, "Capacitador_CUIT,CUIT_Entidad,CUIT_Capacitador,CUIT/CUIL entidad,CUIL/CUIT ent,CUIT_Entidad_Capacitadora,CUIT,Capacitador_CUIL") || '',
+            monto: parseNumber(findValue(record, "Monto Inversion,Monto,Monto_$,Inversion,Costo,Costo_Total,Monto_Inversic,Monto_Inversion") || 0),
+            justificacion: findValue(record, "Justificacion,justificacion_relacion_Act_Prom,Motivo,Justificacion_Costo") || '',
+            facturaFile: findValue(record, "Link_Factura,Factura,Link Factura,Link_Comprobante,Adjunto_Factura,Adj_Factura") || '',
+            programaFile: findValue(record, "Link_Programa,Programa,Link Programa,Adjunto_Programa,Adj_Programa") || '',
+            certificadoFile: findValue(record, "Link_Certificado,Certificado,Link Certificado,Adjunto_Certificado,Adj_Certificado") || '',
             fecha: currentPeriod ? `${currentPeriod}-01` : (findValue(record, "Periodo") ? `${findValue(record, "Periodo")}-01` : new Date().toISOString().slice(0, 10))
           }
         };
@@ -918,27 +1002,29 @@ const ImportarArchivos = ({ db, user, config }) => {
         return {
           collection: 'lec_primer_empleo',
           data: {
-            periodo: formattedPeriod || findValue(record, "Periodo"),
-            cuilEmpleado: findValue(record, "CUIL_Empleado,CUIL") || '',
+            periodo: formattedPeriod || (findValue(record, "Periodo") ? findValue(record, "Periodo").replace('-', '') : ''),
+            cuilEmpleado: findValue(record, "CUIL_Empleado,CUIL,C.U.I.L.") || '',
             apellido: findValue(record, "Apellido") || '',
             nombre: findValue(record, "Nombre") || '',
-            genero: findValue(record, "Genero") || '',
-            fechaAlta: findValue(record, "Fecha_de_alta,Fecha_Alta") || '',
-            remuneracionBruta: parseNumber(findValue(record, "Monto_total_Rem_Bruta_F931,Remuneracion,Bruto") || 0)
+            genero: findValue(record, "Genero,genero") || '',
+            fechaAlta: findValue(record, "Fecha_de_alta,Fecha_Alta,Alta") || '',
+            remuneracionBruta: parseNumber(findValue(record, "Rem_Bruta_F931,Monto_total_Rem_Bruta_F931,Remuneracion_Bruta,Remuneracion,Bruto") || 0),
+            fecha: currentPeriod ? `${currentPeriod}-01` : (findValue(record, "Periodo") ? `${findValue(record, "Periodo").slice(0, 4)}-${findValue(record, "Periodo").slice(4, 6)}-01` : '')
           }
         };
       case 'ADQUISICION_EQUIPAMIENTO':
         return {
           collection: 'lec_adquisicion_equipamiento',
           data: {
-            periodo: formattedPeriod || findValue(record, "Periodo"),
+            periodo: formattedPeriod || (findValue(record, "Periodo") ? findValue(record, "Periodo").replace('-', '') : ''),
             detalle: findValue(record, "Detalle_Equipamiento_Adquirido,Detalle") || '',
             destino: findValue(record, "Destino_del_equipamiento,Destino") || '',
             tipoComprobante: findValue(record, "Tipo_Comprobante") || '',
             nroComprobante: findValue(record, "Nro_Comprobante,N°_Comprobante") || '',
             fechaComprobante: normalizeDate(findValue(record, "Fecha_comprobante,Fecha")) || '',
             costoTotalSinIva: parseNumber(findValue(record, "Costo_Total_sin_iva,Costo_Total_(sin_iva)") || 0),
-            justificacion: findValue(record, "Justificacion") || ''
+            justificacion: findValue(record, "Justificacion") || '',
+            fecha: currentPeriod ? `${currentPeriod}-01` : (findValue(record, "Periodo") ? `${findValue(record, "Periodo").slice(0, 4)}-${findValue(record, "Periodo").slice(4, 6)}-01` : '')
           }
         };
       case 'PROYECTOS':
@@ -984,9 +1070,29 @@ const ImportarArchivos = ({ db, user, config }) => {
       const records = parseCSV(text);
       if (records.length === 0) throw new Error("Archivo vacío o formato incorrecto");
 
+      // DEBUG PREVIEW
+      console.log("Parsed Records:", records.length);
+      console.log("Headers Found in First Record:", Object.keys(records[0]));
+      const sampleMapping = mapRecordToFirestore(records[0], tipoArchivo, periodo);
+      const debugData = {
+        detectedHeaders: Object.keys(records[0]),
+        parsedCount: records.length,
+        firstRecordRaw: records[0],
+        firstRecordMapped: sampleMapping?.data
+      };
+
+      // We will attach this debug info to the state if you add a state for it
+      // Since I can't easily add a new state hook to the component from here without re-writing the whole component,
+      // I will log it and maybe alert if it looks empty?
+      // Better: I will use the 'msg' to show some debug info if it fails
+
+      if (sampleMapping?.data && !sampleMapping.data.cursoTitulo && !sampleMapping.data.monto && tipoArchivo === 'CAPACITACION') {
+        alert("Atención: No se han detectado columnas clave (Curso/Monto). Verifique nombres de columna:\n" + Object.keys(records[0]).join(", "));
+      }
+
       // --- OVERWRITE LOGIC START ---
       const activePeriod = periodo.replace('-', ''); // Convert YYYY-MM to YYYYMM
-      const sampleMapping = mapRecordToFirestore(records[0], tipoArchivo, periodo);
+
       if (sampleMapping && sampleMapping.collection) {
         const collectionPath = `/artifacts/${APP_ID}/public/data/${sampleMapping.collection}`;
         console.log("Checking for existing records in:", collectionPath, "Period:", activePeriod);
@@ -1073,10 +1179,10 @@ const ImportarArchivos = ({ db, user, config }) => {
         timestamp: serverTimestamp()
       });
 
-      setMsg(`Éxito: Se han importado ${count} registros de ${tipoArchivo} para el periodo ${periodo}.`);
+      setMsg(`Éxito: Se han importado ${count} registros de ${tipoArchivo} para el periodo ${periodo}. Camposs encontrados: ${Object.keys(records[0]).length}`);
     } catch (err) {
       console.error(err);
-      setMsg("Error al procesar el archivo. Verifique el formato CSV.");
+      setMsg(`Error al procesar el archivo: ${err.message}. Verifique el formato CSV.`);
     }
     setLoading(false);
     if (fileInputRef.current) fileInputRef.current.value = ""; // Reset input
@@ -1944,7 +2050,7 @@ const CapacitacionTab = ({ db, config, user }) => {
           <thead className="bg-gray-50 text-left">
             <tr>
               <th onClick={() => requestSort('cursoTitulo')} className="p-3 cursor-pointer hover:bg-gray-100">
-                <div className="flex items-center">Curso / Justificación <SortIcon column="cursoTitulo" /></div>
+                <div className="flex items-center">Curso <SortIcon column="cursoTitulo" /></div>
               </th>
               <th onClick={() => requestSort('apellidoAsistente')} className="p-3 cursor-pointer hover:bg-gray-100">
                 <div className="flex items-center">Asistente <SortIcon column="apellidoAsistente" /></div>
@@ -1963,7 +2069,7 @@ const CapacitacionTab = ({ db, config, user }) => {
                 <tr className="hover:bg-gray-50 cursor-pointer border-t" onClick={() => setViewDetail(viewDetail === i.id ? null : i.id)}>
                   <td className="p-3 font-medium">
                     {i.cursoTitulo}
-                    <div className="text-xs text-gray-500 truncate max-w-md">{i.cursoDescripcion || i.justificacion}</div>
+                    <div className="text-xs text-gray-400 truncate max-w-md">{i.cursoDescripcion || 'Sin descripción'}</div>
                   </td>
                   <td className="p-3">
                     {i.apellidoAsistente}, {i.nombreAsistente} ({i.nombreAsistente ? '' : i.nombreAsistenteLegacy})
@@ -1992,9 +2098,15 @@ const CapacitacionTab = ({ db, config, user }) => {
                           </div>
                         </div>
 
-                        <div className="col-span-3">
-                          <span className="font-bold">Descripción del curso:</span>
-                          <p className="text-gray-600 italic mt-1">{i.cursoDescripcion || 'Sin descripción'}</p>
+                        <div className="col-span-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <div className="bg-white p-2 rounded border">
+                            <span className="font-bold text-gray-500 block border-b mb-1">Descripción del curso:</span>
+                            <p className="text-gray-600 italic">{i.cursoDescripcion || 'Sin descripción'}</p>
+                          </div>
+                          <div className="bg-white p-2 rounded border">
+                            <span className="font-bold text-gray-500 block border-b mb-1">Justificación LEC:</span>
+                            <p className="text-gray-600 italic">{i.justificacion || 'Sin justificación'}</p>
+                          </div>
                         </div>
 
                         <div><span className="font-bold">Género:</span> {i.genero}</div>
@@ -2054,7 +2166,11 @@ const PrimerEmpleoTab = ({ db, config, user }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    await addItem(form);
+    const standardizedForm = {
+      ...form,
+      periodo: form.periodo.replace('-', '')
+    };
+    await addItem(standardizedForm);
     setForm({ periodo: '', cuilEmpleado: '', apellido: '', nombre: '', genero: '', fechaAlta: '', remuneracionBruta: 0 });
   };
 
@@ -2168,7 +2284,11 @@ const AdquisicionEquipamientoTab = ({ db, config, user }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    await addItem(form);
+    const standardizedForm = {
+      ...form,
+      periodo: form.periodo.replace('-', '')
+    };
+    await addItem(standardizedForm);
     setForm({ periodo: '', detalle: '', destino: '', tipoComprobante: '', nroComprobante: '', fechaComprobante: '', costoTotalSinIva: 0, justificacion: '' });
   };
 
@@ -2773,7 +2893,8 @@ const ConfiguracionLEC = ({ db, lecConfig, selectedBienio, user }) => {
             targetTraining: cfg.targetTraining,
             targetPctID: cfg.targetPctID,
             targetIDCount: cfg.targetIDCount,
-            targetQualityCount: cfg.targetQualityCount
+            targetQualityCount: cfg.targetQualityCount,
+            targetPayroll: cfg.targetPayroll
           }
         });
       }
@@ -2840,6 +2961,11 @@ const ConfiguracionLEC = ({ db, lecConfig, selectedBienio, user }) => {
             <div>
               <label className="block text-xs font-bold text-gray-600">Meta Cantidad Normas Calidad</label>
               <input type="number" value={cfg.targetQualityCount} onChange={e => setCfg({ ...cfg, targetQualityCount: parseInt(e.target.value) })} className="w-full border p-2 rounded" />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-blue-600">Masa Salarial Anual Objetivo ($) [Para Capacitación]</label>
+              <input type="number" value={cfg.targetPayroll || ''} onChange={e => setCfg({ ...cfg, targetPayroll: parseFloat(e.target.value) || 0 })} className="w-full border-2 border-blue-100 p-2 rounded focus:border-blue-500 outline-none" placeholder="Ej: 50000000" />
+              <p className="text-[10px] text-gray-400 mt-1">Si es 0, se auto-calculará en base al promedio actual y meta de personas.</p>
             </div>
           </div>
         </div>
@@ -3125,6 +3251,7 @@ const App = () => {
       targetPctID: selectedBienio.targets?.targetPctID ?? 0,
       targetIDCount: selectedBienio.targets?.targetIDCount ?? 1,
       targetQualityCount: selectedBienio.targets?.targetQualityCount ?? 1,
+      targetPayroll: selectedBienio.targets?.targetPayroll ?? 0,
       qualityNorms: systemConfig?.qualityNorms || [],
       importFields: systemConfig?.importFields || defaultImportFields
     };
